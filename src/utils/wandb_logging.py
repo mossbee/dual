@@ -15,9 +15,7 @@ def maybe_init_wandb(enable: bool, project: str, run_name: Optional[str], config
     except ImportError as exc:
         raise RuntimeError("wandb is not installed. Install it or disable --wandb.") from exc
     api_key = os.environ.get("WANDB_API_KEY")
-    api_key_2 = os.getenv("WANDB_API_KEY")
     print(f"api_key: {api_key}")
-    print(f"api_key_2: {api_key_2}")
     if api_key:
         wandb.login(key=api_key)
     return wandb.init(project=project, name=run_name, config=config)
