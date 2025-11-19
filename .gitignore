@@ -1,0 +1,5 @@
+*.pyc
+data/
+refs/
+tests/
+weights/
