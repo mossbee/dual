@@ -9,7 +9,7 @@ from typing import Dict, Optional
 import torch
 from torch import nn
 
-from attention.rollout import rollout, topk_local_indices
+from attention.rollout import topk_local_indices
 from models.vit_backbone import ViTBackbone, ViTConfig, vit_b16_config
 
 
@@ -106,16 +106,19 @@ class DCALViT(nn.Module):
         enable_pwca: bool = False,
         pair_indices: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        seq, attn_stack = self.backbone(images, return_attn=enable_glca)
+        seq, rollout_map = self.backbone(
+            images,
+            return_rollout=enable_glca,
+            head_fusion=self.cfg.head_fusion,
+        )
         cls = seq[:, 0]
         outputs: Dict[str, torch.Tensor] = {
             "tokens": seq,
             "cls": cls,
             "sa_logits": self.sa_head(cls),
         }
-        if enable_glca:
+        if enable_glca and rollout_map is not None:
             ratio = local_ratio or self.cfg.local_ratio
-            rollout_map = rollout(attn_stack, head_fusion=self.cfg.head_fusion)
             idx = topk_local_indices(rollout_map, ratio)
             local_tokens = gather_tokens(seq, idx)
             fused = self.glca(local_tokens, seq)

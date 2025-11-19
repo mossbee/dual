@@ -97,6 +97,16 @@ class MultiHeadSelfAttention(nn.Module):
         return out, attn
 
 
+def fuse_heads_local(attn: torch.Tensor, mode: str) -> torch.Tensor:
+    if mode == "mean":
+        return attn.mean(dim=1)
+    if mode == "max":
+        return attn.max(dim=1)[0]
+    if mode == "min":
+        return attn.min(dim=1)[0]
+    raise ValueError(f"Unsupported head fusion mode: {mode}")
+
+
 class MLP(nn.Module):
     def __init__(self, hidden_size: int, mlp_dim: int, dropout_rate: float):
         super().__init__()
@@ -147,15 +157,28 @@ class ViTBackbone(nn.Module):
     def hidden_size(self) -> int:
         return self.config.hidden_size
 
-    def forward(self, x: torch.Tensor, return_attn: bool = False) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_rollout: bool = False,
+        head_fusion: str = "mean",
+        add_residual: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
         x = self.patch_embed(x)
-        attn_collector: List[torch.Tensor] = []
+        rollout_acc = None
         for block in self.blocks:
             x, attn = block(x)
-            if return_attn:
-                attn_collector.append(attn.detach())
+            if return_rollout:
+                fused = fuse_heads_local(attn, head_fusion).detach()
+                if add_residual:
+                    eye = torch.eye(
+                        fused.size(-1), device=fused.device, dtype=fused.dtype
+                    )
+                    fused = 0.5 * fused + 0.5 * eye
+                fused = fused / fused.sum(dim=-1, keepdim=True)
+                rollout_acc = fused if rollout_acc is None else fused @ rollout_acc
         x = self.norm(x)
-        return x, attn_collector
+        return x, rollout_acc
 
     def load_from_npz(self, npz_path: str):
         weights = np.load(npz_path, allow_pickle=True)
