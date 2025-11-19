@@ -116,6 +116,7 @@ def main():
 
     best_acc = 0.0
     for epoch in range(1, args.epochs + 1):
+        print(f"Epoch {epoch:03d}:")
         stats = train_one_epoch(model, uncertainty, train_loader, optimizer, criterion, device)
         val_acc = evaluate(model, val_loader, device)
         scheduler.step()
