@@ -32,6 +32,8 @@ def parse_args():
     parser.add_argument("--weight-decay", default=1e-4, type=float)
     parser.add_argument("--triplet-margin", default=0.3, type=float)
     parser.add_argument("--device", default="cuda", type=str)
+    parser.add_argument("--log-interval", default=50, type=int, help="log training metrics every N batches")
+    parser.add_argument("--val-interval", default=1, type=int, help="run evaluation every N epochs")
     parser.add_argument("--wandb", action="store_true", help="enable Weights & Biases logging")
     parser.add_argument("--wandb-project", default="dcal", type=str)
     parser.add_argument("--wandb-run-name", default=None, type=str)
@@ -53,12 +55,24 @@ def batch_hard_triplet(embeddings: torch.Tensor, labels: torch.Tensor, margin: f
     return loss.mean()
 
 
-def train_one_epoch(model, uncertainty, loader, optimizer, ce_loss, margin, device):
+def train_one_epoch(
+    model,
+    uncertainty,
+    loader,
+    optimizer,
+    ce_loss,
+    margin,
+    device,
+    epoch: int,
+    log_interval: int,
+    wandb_run,
+    global_step_start: int,
+):
     model.train()
     uncertainty.train()
     total_loss = 0.0
     steps = 0
-    for batch in loader:
+    for step_idx, batch in enumerate(loader, start=1):
         images = batch["image"].to(device)
         labels = batch["pid"].to(device)
         perm = torch.randperm(images.size(0), device=device)
@@ -76,6 +90,19 @@ def train_one_epoch(model, uncertainty, loader, optimizer, ce_loss, margin, devi
 
         total_loss += loss.item()
         steps += 1
+
+        if log_interval > 0 and (step_idx % log_interval == 0 or step_idx == 1):
+            global_step = global_step_start + step_idx
+            wandb_log(
+                wandb_run,
+                {
+                    "epoch": epoch,
+                    "step": global_step,
+                    "train/batch_loss": loss.item(),
+                    "lr": optimizer.param_groups[0]["lr"],
+                },
+            )
+            print(f"[Epoch {epoch:03d} | Step {step_idx:04d}] loss={loss.item():.4f}")
     return total_loss / steps
 
 
@@ -141,24 +168,41 @@ def main():
     )
 
     best_map = 0.0
+    steps_per_epoch = len(train_loader)
     for epoch in range(1, args.epochs + 1):
-        loss = train_one_epoch(model, uncertainty, train_loader, optimizer, ce_loss, args.triplet_margin, device)
-        scheduler.step()
-        q_feats, q_pids, q_cam = extract_features(model, query_loader, device)
-        g_feats, g_pids, g_cam = extract_features(model, gallery_loader, device)
-        metrics = reid_metrics(q_feats, q_pids, q_cam, g_feats, g_pids, g_cam)
-        print(f"Epoch {epoch:03d}: loss={loss:.4f} mAP={metrics['mAP']:.4f} R1={metrics['Rank-1']:.4f}")
-        wandb_log(
+        print(f"Epoch {epoch:03d}:")
+        loss = train_one_epoch(
+            model,
+            uncertainty,
+            train_loader,
+            optimizer,
+            ce_loss,
+            args.triplet_margin,
+            device,
+            epoch,
+            args.log_interval,
             wandb_run,
-            {
-                "epoch": epoch,
-                "train/loss": loss,
-                "val/mAP": metrics["mAP"],
-                "val/Rank-1": metrics["Rank-1"],
-                "lr": optimizer.param_groups[0]["lr"],
-            },
+            global_step_start=(epoch - 1) * steps_per_epoch,
         )
-        if metrics["mAP"] > best_map:
+        scheduler.step()
+        metrics = None
+        if args.val_interval > 0 and epoch % args.val_interval == 0:
+            q_feats, q_pids, q_cam = extract_features(model, query_loader, device)
+            g_feats, g_pids, g_cam = extract_features(model, gallery_loader, device)
+            metrics = reid_metrics(q_feats, q_pids, q_cam, g_feats, g_pids, g_cam)
+            print(f"Epoch {epoch:03d}: loss={loss:.4f} mAP={metrics['mAP']:.4f} R1={metrics['Rank-1']:.4f}")
+        else:
+            print(f"Epoch {epoch:03d}: loss={loss:.4f} (validation skipped)")
+        log_payload = {
+            "epoch": epoch,
+            "train/loss": loss,
+            "lr": optimizer.param_groups[0]["lr"],
+        }
+        if metrics is not None:
+            log_payload["val/mAP"] = metrics["mAP"]
+            log_payload["val/Rank-1"] = metrics["Rank-1"]
+        wandb_log(wandb_run, log_payload)
+        if metrics is not None and metrics["mAP"] > best_map:
             best_map = metrics["mAP"]
             ckpt = {
                 "model": model.state_dict(),

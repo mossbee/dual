@@ -29,19 +29,32 @@ def parse_args():
     parser.add_argument("--local-ratio", default=0.1, type=float)
     parser.add_argument("--drop-path", default=0.1, type=float)
     parser.add_argument("--device", default="cuda", type=str)
+    parser.add_argument("--log-interval", default=50, type=int, help="log training metrics every N batches")
+    parser.add_argument("--val-interval", default=1, type=int, help="run validation every N epochs")
     parser.add_argument("--wandb", action="store_true", help="enable Weights & Biases logging")
     parser.add_argument("--wandb-project", default="dcal", type=str)
     parser.add_argument("--wandb-run-name", default=None, type=str)
     return parser.parse_args()
 
 
-def train_one_epoch(model, uncertainty, loader, optimizer, criterion, device):
+def train_one_epoch(
+    model,
+    uncertainty,
+    loader,
+    optimizer,
+    criterion,
+    device,
+    epoch: int,
+    log_interval: int,
+    wandb_run,
+    global_step_start: int,
+):
     model.train()
     uncertainty.train()
     total_loss = 0.0
     total_acc = 0.0
     steps = 0
-    for batch in loader:
+    for step_idx, batch in enumerate(loader, start=1):
         images = batch["image"].to(device)
         labels = batch["label"].to(device)
         perm = torch.randperm(images.size(0), device=device)
@@ -56,8 +69,26 @@ def train_one_epoch(model, uncertainty, loader, optimizer, criterion, device):
         optimizer.step()
 
         total_loss += loss.item()
-        total_acc += fused_accuracy(outputs["sa_logits"], outputs["glca_logits"], labels)
+        batch_acc = fused_accuracy(outputs["sa_logits"], outputs["glca_logits"], labels)
+        total_acc += batch_acc
         steps += 1
+
+        if log_interval > 0 and (step_idx % log_interval == 0 or step_idx == 1):
+            global_step = global_step_start + step_idx
+            wandb_log(
+                wandb_run,
+                {
+                    "epoch": epoch,
+                    "step": global_step,
+                    "train/batch_loss": loss.item(),
+                    "train/batch_acc": batch_acc,
+                    "lr": optimizer.param_groups[0]["lr"],
+                },
+            )
+            print(
+                f"[Epoch {epoch:03d} | Step {step_idx:04d}] "
+                f"loss={loss.item():.4f} batch_acc={batch_acc:.4f}"
+            )
     return {"loss": total_loss / steps, "acc": total_acc / steps}
 
 
@@ -115,23 +146,41 @@ def main():
     )
 
     best_acc = 0.0
+    steps_per_epoch = len(train_loader)
     for epoch in range(1, args.epochs + 1):
         print(f"Epoch {epoch:03d}:")
-        stats = train_one_epoch(model, uncertainty, train_loader, optimizer, criterion, device)
-        val_acc = evaluate(model, val_loader, device)
-        scheduler.step()
-        print(f"Epoch {epoch:03d}: loss={stats['loss']:.4f} train_acc={stats['acc']:.4f} val_acc={val_acc:.4f}")
-        wandb_log(
+        stats = train_one_epoch(
+            model,
+            uncertainty,
+            train_loader,
+            optimizer,
+            criterion,
+            device,
+            epoch,
+            args.log_interval,
             wandb_run,
-            {
-                "epoch": epoch,
-                "train/loss": stats["loss"],
-                "train/acc": stats["acc"],
-                "val/acc": val_acc,
-                "lr": optimizer.param_groups[0]["lr"],
-            },
+            global_step_start=(epoch - 1) * steps_per_epoch,
         )
-        if val_acc > best_acc:
+        val_acc = None
+        if args.val_interval > 0 and epoch % args.val_interval == 0:
+            val_acc = evaluate(model, val_loader, device)
+            print(
+                f"Epoch {epoch:03d}: loss={stats['loss']:.4f} train_acc={stats['acc']:.4f} "
+                f"val_acc={val_acc:.4f}"
+            )
+        else:
+            print(f"Epoch {epoch:03d}: loss={stats['loss']:.4f} train_acc={stats['acc']:.4f} (validation skipped)")
+        scheduler.step()
+        log_payload = {
+            "epoch": epoch,
+            "train/loss": stats["loss"],
+            "train/acc": stats["acc"],
+            "lr": optimizer.param_groups[0]["lr"],
+        }
+        if val_acc is not None:
+            log_payload["val/acc"] = val_acc
+        wandb_log(wandb_run, log_payload)
+        if val_acc is not None and val_acc > best_acc:
             best_acc = val_acc
             ckpt = {
                 "model": model.state_dict(),
