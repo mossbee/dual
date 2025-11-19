@@ -3,3 +3,4 @@ data/
 refs/
 tests/
 weights/
+.pytest_cache/

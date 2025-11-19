@@ -14,6 +14,7 @@ from losses.uncertainty import UncertaintyWeighting
 from models.vit_dcal import DCALConfig, DCALViT
 from utils.data import build_cub_transforms, build_loader
 from utils.metrics import fused_accuracy
+from utils.wandb_logging import maybe_init_wandb, wandb_finish, wandb_log
 
 
 def parse_args():
@@ -28,6 +29,9 @@ def parse_args():
     parser.add_argument("--local-ratio", default=0.1, type=float)
     parser.add_argument("--drop-path", default=0.1, type=float)
     parser.add_argument("--device", default="cuda", type=str)
+    parser.add_argument("--wandb", action="store_true", help="enable Weights & Biases logging")
+    parser.add_argument("--wandb-project", default="dcal", type=str)
+    parser.add_argument("--wandb-run-name", default=None, type=str)
     return parser.parse_args()
 
 
@@ -96,12 +100,36 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     criterion = nn.CrossEntropyLoss()
 
+    wandb_run = maybe_init_wandb(
+        args.wandb,
+        args.wandb_project,
+        args.wandb_run_name,
+        {
+            "task": "fgvc_cub",
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": scaled_lr,
+            "local_ratio": args.local_ratio,
+            "drop_path": args.drop_path,
+        },
+    )
+
     best_acc = 0.0
     for epoch in range(1, args.epochs + 1):
         stats = train_one_epoch(model, uncertainty, train_loader, optimizer, criterion, device)
         val_acc = evaluate(model, val_loader, device)
         scheduler.step()
         print(f"Epoch {epoch:03d}: loss={stats['loss']:.4f} train_acc={stats['acc']:.4f} val_acc={val_acc:.4f}")
+        wandb_log(
+            wandb_run,
+            {
+                "epoch": epoch,
+                "train/loss": stats["loss"],
+                "train/acc": stats["acc"],
+                "val/acc": val_acc,
+                "lr": optimizer.param_groups[0]["lr"],
+            },
+        )
         if val_acc > best_acc:
             best_acc = val_acc
             ckpt = {
@@ -112,6 +140,7 @@ def main():
                 "val_acc": val_acc,
             }
             torch.save(ckpt, Path(args.output) / "best.pt")
+    wandb_finish(wandb_run)
 
 
 if __name__ == "__main__":

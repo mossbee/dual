@@ -29,7 +29,8 @@ pip install torch torchvision
 PYTHONPATH=src python3 -m tasks.fgvc_cub \
   --data-root data/CUB_200_2011 \
   --weights weights/ViT-B_16.npz \
-  --output runs/fgvc_cub
+  --output runs/fgvc_cub \
+  --wandb --wandb-project dcal --wandb-run-name cub-run
 ```
 This trains for 100 epochs using AdamW, stochastic depth, GLCA (top 10%) and PWCA regularization. Validation accuracy uses SA+GLCA probability fusion.
 
@@ -38,9 +39,12 @@ This trains for 100 epochs using AdamW, stochastic depth, GLCA (top 10%) and PWC
 PYTHONPATH=src python3 -m tasks.reid_veri \
   --data-root data/VeRi_776 \
   --weights weights/ViT-B_16.npz \
-  --output runs/reid_veri
+  --output runs/reid_veri \
+  --wandb --wandb-project dcal --wandb-run-name veri-run
 ```
 This config matches the paper: SGD optimizer, batch size 64 with 4 images per identity, local ratio 0.3, cosine LR decay. Evaluation reports mAP and Rank-1 using concatenated SA/GLCA tokens.
+
+WANDB logging is optional; it activates when `--wandb` is specified. The API key is read from `WANDB_API_KEY`.
 
 ## Testing
 Run smoke tests to ensure the model graph builds:

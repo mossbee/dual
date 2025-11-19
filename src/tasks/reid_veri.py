@@ -14,6 +14,7 @@ from losses.uncertainty import UncertaintyWeighting
 from models.vit_dcal import DCALConfig, DCALViT
 from utils.data import RandomIdentitySampler, build_loader, build_veri_transforms
 from utils.metrics import pairwise_distance, reid_metrics
+from utils.wandb_logging import maybe_init_wandb, wandb_finish, wandb_log
 
 
 def parse_args():
@@ -31,6 +32,9 @@ def parse_args():
     parser.add_argument("--weight-decay", default=1e-4, type=float)
     parser.add_argument("--triplet-margin", default=0.3, type=float)
     parser.add_argument("--device", default="cuda", type=str)
+    parser.add_argument("--wandb", action="store_true", help="enable Weights & Biases logging")
+    parser.add_argument("--wandb-project", default="dcal", type=str)
+    parser.add_argument("--wandb-run-name", default=None, type=str)
     return parser.parse_args()
 
 
@@ -121,6 +125,21 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     ce_loss = nn.CrossEntropyLoss()
 
+    wandb_run = maybe_init_wandb(
+        args.wandb,
+        args.wandb_project,
+        args.wandb_run_name,
+        {
+            "task": "reid_veri",
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "instances_per_id": args.instances_per_id,
+            "lr": args.lr,
+            "local_ratio": args.local_ratio,
+            "triplet_margin": args.triplet_margin,
+        },
+    )
+
     best_map = 0.0
     for epoch in range(1, args.epochs + 1):
         loss = train_one_epoch(model, uncertainty, train_loader, optimizer, ce_loss, args.triplet_margin, device)
@@ -129,6 +148,16 @@ def main():
         g_feats, g_pids, g_cam = extract_features(model, gallery_loader, device)
         metrics = reid_metrics(q_feats, q_pids, q_cam, g_feats, g_pids, g_cam)
         print(f"Epoch {epoch:03d}: loss={loss:.4f} mAP={metrics['mAP']:.4f} R1={metrics['Rank-1']:.4f}")
+        wandb_log(
+            wandb_run,
+            {
+                "epoch": epoch,
+                "train/loss": loss,
+                "val/mAP": metrics["mAP"],
+                "val/Rank-1": metrics["Rank-1"],
+                "lr": optimizer.param_groups[0]["lr"],
+            },
+        )
         if metrics["mAP"] > best_map:
             best_map = metrics["mAP"]
             ckpt = {
@@ -139,6 +168,7 @@ def main():
                 "metrics": metrics,
             }
             torch.save(ckpt, Path(args.output) / "best.pt")
+    wandb_finish(wandb_run)
 
 
 if __name__ == "__main__":
