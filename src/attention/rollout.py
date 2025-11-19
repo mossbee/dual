@@ -40,14 +40,15 @@ def rollout(
     if not attentions:
         raise ValueError("Need at least one attention map for rollout.")
     device = attentions[0].device
-    result = None
-    for attn in attentions:
-        fused = fuse_heads(attn, head_fusion)
-        if add_residual:
-            eye = torch.eye(fused.size(-1), device=device)
-            fused = 0.5 * fused + 0.5 * eye
-        fused = fused / fused.sum(dim=-1, keepdim=True)
-        result = fused if result is None else fused @ result
+    with torch.no_grad():
+        result = None
+        for attn in attentions:
+            fused = fuse_heads(attn, head_fusion)
+            if add_residual:
+                eye = torch.eye(fused.size(-1), device=device)
+                fused = 0.5 * fused + 0.5 * eye
+            fused = fused / fused.sum(dim=-1, keepdim=True)
+            result = fused if result is None else fused @ result
     return result
 
 

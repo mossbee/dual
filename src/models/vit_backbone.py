@@ -153,7 +153,7 @@ class ViTBackbone(nn.Module):
         for block in self.blocks:
             x, attn = block(x)
             if return_attn:
-                attn_collector.append(attn)
+                attn_collector.append(attn.detach())
         x = self.norm(x)
         return x, attn_collector
 
