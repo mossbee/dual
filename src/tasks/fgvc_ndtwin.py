@@ -119,7 +119,7 @@ def main():
         val_dataset, batch_size=args.eval_batch_size, num_workers=args.num_workers, shuffle=False
     )
 
-    cfg = DCALConfig(img_size=448, num_classes=200, local_ratio=args.local_ratio, drop_path_rate=args.drop_path)
+    cfg = DCALConfig(img_size=448, num_classes=347, local_ratio=args.local_ratio, drop_path_rate=args.drop_path)
     model = DCALViT(cfg)
     model.load_pretrained(args.weights)
     model.to(device)
