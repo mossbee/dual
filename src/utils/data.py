@@ -33,6 +33,21 @@ def build_cub_transforms(train: bool):
         ]
     )
 
+def build_ndtwin_transforms(train: bool):
+    if train:
+        return transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+            ]
+        )
+    return transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ]
+    )
+
 
 def build_veri_transforms(train: bool, size=(256, 256)):
     if train:
