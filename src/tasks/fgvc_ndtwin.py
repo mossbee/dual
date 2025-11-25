@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import logging
 
 import torch
 from torch import nn
@@ -14,7 +15,6 @@ from losses.uncertainty import UncertaintyWeighting
 from models.vit_dcal import DCALConfig, DCALViT
 from utils.data import build_ndtwin_transforms, build_loader
 from utils.metrics import fused_accuracy, cosine_similarity, euclidean_similarity, verification_metrics
-from utils.wandb_logging import maybe_init_wandb, wandb_finish, wandb_log
 
 
 def parse_args():
@@ -31,9 +31,7 @@ def parse_args():
     parser.add_argument("--device", default="cuda", type=str)
     parser.add_argument("--log-interval", default=50, type=int, help="log training metrics every N batches")
     parser.add_argument("--val-interval", default=1, type=int, help="run validation every N epochs")
-    parser.add_argument("--wandb", action="store_true", help="enable Weights & Biases logging")
-    parser.add_argument("--wandb-project", default="dcal", type=str)
-    parser.add_argument("--wandb-run-name", default=None, type=str)
+    parser.add_argument("--log-file", default="training.log", type=str, help="name of log file stored under output dir")
     parser.add_argument(
         "--similarity-metric",
         default="cosine",
@@ -42,6 +40,27 @@ def parse_args():
         help="Similarity metric for verification: 'cosine' or 'euclidean'",
     )
     return parser.parse_args()
+
+
+def setup_logger(log_file: Path) -> logging.Logger:
+    """
+    Configure a logger that writes both to stdout and a file.
+    """
+    logger = logging.getLogger("fgvc_ndtwin")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.handlers.clear()
+
+    formatter = logging.Formatter("%(asctime)s - %(message)s")
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    return logger
 
 
 def train_one_epoch(
@@ -53,7 +72,7 @@ def train_one_epoch(
     device,
     epoch: int,
     log_interval: int,
-    wandb_run,
+    logger: logging.Logger,
     global_step_start: int,
 ):
     model.train()
@@ -82,20 +101,11 @@ def train_one_epoch(
 
         if log_interval > 0 and (step_idx % log_interval == 0 or step_idx == 1):
             global_step = global_step_start + step_idx
-            wandb_log(
-                wandb_run,
-                {
-                    "epoch": epoch,
-                    "step": global_step,
-                    "train/batch_loss": loss.item(),
-                    "train/batch_acc": batch_acc,
-                    "lr": optimizer.param_groups[0]["lr"],
-                },
+            log_msg = (
+                f"[Epoch {epoch:03d} | Step {step_idx:04d} | Global {global_step:06d}] "
+                f"loss={loss.item():.4f} batch_acc={batch_acc:.4f} lr={optimizer.param_groups[0]['lr']:.6f}"
             )
-            print(
-                f"[Epoch {epoch:03d} | Step {step_idx:04d}] "
-                f"loss={loss.item():.4f} batch_acc={batch_acc:.4f}"
-            )
+            logger.info(log_msg)
     return {"loss": total_loss / steps, "acc": total_acc / steps}
 
 
@@ -174,7 +184,11 @@ def evaluate(model, data_root: str, device: torch.device, similarity_metric: str
 def main():
     args = parse_args()
     device = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
-    Path(args.output).mkdir(parents=True, exist_ok=True)
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_file = output_dir / args.log_file
+    logger = setup_logger(log_file)
+    logger.info("Initialized training script for DCAL on NDTWIN")
 
     train_dataset = NDTWINDataset(args.data_root, split="train", transform=build_ndtwin_transforms(True))
     train_loader = build_loader(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers)
@@ -191,25 +205,10 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     criterion = nn.CrossEntropyLoss()
 
-    wandb_run = maybe_init_wandb(
-        args.wandb,
-        args.wandb_project,
-        args.wandb_run_name,
-        {
-            "task": "fgvc_ndtwin",
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "lr": scaled_lr,
-            "local_ratio": args.local_ratio,
-            "drop_path": args.drop_path,
-            "similarity_metric": args.similarity_metric,
-        },
-    )
-
     best_acc = 0.0
     steps_per_epoch = len(train_loader)
     for epoch in range(1, args.epochs + 1):
-        print(f"Epoch {epoch:03d}:")
+        logger.info(f"Epoch {epoch:03d} started")
         stats = train_one_epoch(
             model,
             uncertainty,
@@ -219,7 +218,7 @@ def main():
             device,
             epoch,
             args.log_interval,
-            wandb_run,
+            logger,
             global_step_start=(epoch - 1) * steps_per_epoch,
         )
         val_metrics = None
@@ -227,28 +226,17 @@ def main():
             val_metrics = evaluate(
                 model, args.data_root, device, args.similarity_metric, args.eval_batch_size, args.num_workers
             )
-            print(
+            logger.info(
                 f"Epoch {epoch:03d}: loss={stats['loss']:.4f} train_acc={stats['acc']:.4f} "
                 f"val_best_acc={val_metrics['best_acc']:.4f} val_eer={val_metrics['eer']:.4f} "
                 f"val_roc_auc={val_metrics['roc_auc']:.4f} val_tar={val_metrics['tar']:.4f} "
                 f"val_far={val_metrics['far']:.4f}"
             )
         else:
-            print(f"Epoch {epoch:03d}: loss={stats['loss']:.4f} train_acc={stats['acc']:.4f} (validation skipped)")
+            logger.info(
+                f"Epoch {epoch:03d}: loss={stats['loss']:.4f} train_acc={stats['acc']:.4f} (validation skipped)"
+            )
         scheduler.step()
-        log_payload = {
-            "epoch": epoch,
-            "train/loss": stats["loss"],
-            "train/acc": stats["acc"],
-            "lr": optimizer.param_groups[0]["lr"],
-        }
-        if val_metrics is not None:
-            log_payload["val/best_acc"] = val_metrics["best_acc"]
-            log_payload["val/eer"] = val_metrics["eer"]
-            log_payload["val/roc_auc"] = val_metrics["roc_auc"]
-            log_payload["val/tar"] = val_metrics["tar"]
-            log_payload["val/far"] = val_metrics["far"]
-        wandb_log(wandb_run, log_payload)
         if val_metrics is not None and val_metrics["best_acc"] > best_acc:
             best_acc = val_metrics["best_acc"]
             ckpt = {
@@ -262,8 +250,9 @@ def main():
                 "val_tar": val_metrics["tar"],
                 "val_far": val_metrics["far"],
             }
-            torch.save(ckpt, Path(args.output) / "best.pt")
-    wandb_finish(wandb_run)
+            torch.save(ckpt, output_dir / "best.pt")
+            logger.info(f"New best accuracy {best_acc:.4f} at epoch {epoch:03d}; checkpoint saved to best.pt")
+    logger.info("Training completed")
 
 
 if __name__ == "__main__":
