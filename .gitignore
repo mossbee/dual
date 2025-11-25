@@ -1,7 +1,7 @@
 *.pyc
+weights/
 data/
 refs/
 tests/
-weights/
 .pytest_cache/
 DCAL_VERIFICATION_REPORT.md

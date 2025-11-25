@@ -9,11 +9,11 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from datasets import NDTWINDataset
+from datasets import NDTWINDataset, NDTWINUniqueImageDataset, NDTWINVerificationDataset
 from losses.uncertainty import UncertaintyWeighting
 from models.vit_dcal import DCALConfig, DCALViT
 from utils.data import build_ndtwin_transforms, build_loader
-from utils.metrics import fused_accuracy
+from utils.metrics import fused_accuracy, cosine_similarity, euclidean_similarity, verification_metrics
 from utils.wandb_logging import maybe_init_wandb, wandb_finish, wandb_log
 
 
@@ -34,6 +34,13 @@ def parse_args():
     parser.add_argument("--wandb", action="store_true", help="enable Weights & Biases logging")
     parser.add_argument("--wandb-project", default="dcal", type=str)
     parser.add_argument("--wandb-run-name", default=None, type=str)
+    parser.add_argument(
+        "--similarity-metric",
+        default="cosine",
+        choices=["cosine", "euclidean"],
+        type=str,
+        help="Similarity metric for verification: 'cosine' or 'euclidean'",
+    )
     return parser.parse_args()
 
 
@@ -93,17 +100,75 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(model, data_root: str, device: torch.device, similarity_metric: str, eval_batch_size: int, num_workers: int):
+    """
+    Evaluate model on verification task using test pairs.
+    
+    Args:
+        model: DCAL model
+        data_root: Root directory of dataset
+        device: Device to run on
+        similarity_metric: 'cosine' or 'euclidean'
+        eval_batch_size: Batch size for feature extraction
+        num_workers: Number of workers for DataLoader
+    
+    Returns:
+        Dictionary with verification metrics
+    """
     model.eval()
-    total_acc = 0.0
-    steps = 0
-    for batch in loader:
+    
+    # Load verification pairs
+    verif_dataset = NDTWINVerificationDataset(data_root, transform=build_ndtwin_transforms(False))
+    
+    # Get all unique images
+    unique_image_paths = verif_dataset.get_unique_images()
+    
+    # Extract features for all unique images
+    unique_image_dataset = NDTWINUniqueImageDataset(unique_image_paths, transform=build_ndtwin_transforms(False))
+    unique_loader = build_loader(
+        unique_image_dataset, batch_size=eval_batch_size, num_workers=num_workers, shuffle=False
+    )
+    
+    # Cache features
+    feature_cache = {}
+    for batch in unique_loader:
         images = batch["image"].to(device)
-        labels = batch["label"].to(device)
+        paths = batch["path"]
         outputs = model(images, enable_glca=True, enable_pwca=False)
-        total_acc += fused_accuracy(outputs["sa_logits"], outputs["glca_logits"], labels)
-        steps += 1
-    return total_acc / steps
+        # Use fused representation: concat cls and glca_repr
+        fused_feat = torch.cat([outputs["cls"], outputs.get("glca_repr", outputs["cls"])], dim=-1)
+        for i, path in enumerate(paths):
+            feature_cache[path] = fused_feat[i].cpu()
+    
+    # Compute similarities for all pairs
+    similarities = []
+    labels = []
+    
+    for i in range(len(verif_dataset)):
+        pair_data = verif_dataset[i]
+        path1 = pair_data["path1"]
+        path2 = pair_data["path2"]
+        label = pair_data["label"]
+        
+        feat1 = feature_cache[path1].unsqueeze(0).to(device)
+        feat2 = feature_cache[path2].unsqueeze(0).to(device)
+        
+        if similarity_metric == "cosine":
+            sim = cosine_similarity(feat1, feat2).item()
+        else:  # euclidean
+            sim = euclidean_similarity(feat1, feat2).item()
+        
+        similarities.append(sim)
+        labels.append(label)
+    
+    # Convert to tensors
+    similarities_tensor = torch.tensor(similarities, device=device)
+    labels_tensor = torch.tensor(labels, device=device, dtype=torch.long)
+    
+    # Compute metrics
+    metrics = verification_metrics(similarities_tensor, labels_tensor)
+    
+    return metrics
 
 
 def main():
@@ -112,12 +177,7 @@ def main():
     Path(args.output).mkdir(parents=True, exist_ok=True)
 
     train_dataset = NDTWINDataset(args.data_root, split="train", transform=build_ndtwin_transforms(True))
-    val_dataset = NDTWINDataset(args.data_root, split="val", transform=build_ndtwin_transforms(False))
-
     train_loader = build_loader(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers)
-    val_loader = build_loader(
-        val_dataset, batch_size=args.eval_batch_size, num_workers=args.num_workers, shuffle=False
-    )
 
     cfg = DCALConfig(img_size=448, num_classes=347, local_ratio=args.local_ratio, drop_path_rate=args.drop_path)
     model = DCALViT(cfg)
@@ -142,6 +202,7 @@ def main():
             "lr": scaled_lr,
             "local_ratio": args.local_ratio,
             "drop_path": args.drop_path,
+            "similarity_metric": args.similarity_metric,
         },
     )
 
@@ -161,12 +222,16 @@ def main():
             wandb_run,
             global_step_start=(epoch - 1) * steps_per_epoch,
         )
-        val_acc = None
+        val_metrics = None
         if args.val_interval > 0 and epoch % args.val_interval == 0:
-            val_acc = evaluate(model, val_loader, device)
+            val_metrics = evaluate(
+                model, args.data_root, device, args.similarity_metric, args.eval_batch_size, args.num_workers
+            )
             print(
                 f"Epoch {epoch:03d}: loss={stats['loss']:.4f} train_acc={stats['acc']:.4f} "
-                f"val_acc={val_acc:.4f}"
+                f"val_best_acc={val_metrics['best_acc']:.4f} val_eer={val_metrics['eer']:.4f} "
+                f"val_roc_auc={val_metrics['roc_auc']:.4f} val_tar={val_metrics['tar']:.4f} "
+                f"val_far={val_metrics['far']:.4f}"
             )
         else:
             print(f"Epoch {epoch:03d}: loss={stats['loss']:.4f} train_acc={stats['acc']:.4f} (validation skipped)")
@@ -177,17 +242,25 @@ def main():
             "train/acc": stats["acc"],
             "lr": optimizer.param_groups[0]["lr"],
         }
-        if val_acc is not None:
-            log_payload["val/acc"] = val_acc
+        if val_metrics is not None:
+            log_payload["val/best_acc"] = val_metrics["best_acc"]
+            log_payload["val/eer"] = val_metrics["eer"]
+            log_payload["val/roc_auc"] = val_metrics["roc_auc"]
+            log_payload["val/tar"] = val_metrics["tar"]
+            log_payload["val/far"] = val_metrics["far"]
         wandb_log(wandb_run, log_payload)
-        if val_acc is not None and val_acc > best_acc:
-            best_acc = val_acc
+        if val_metrics is not None and val_metrics["best_acc"] > best_acc:
+            best_acc = val_metrics["best_acc"]
             ckpt = {
                 "model": model.state_dict(),
                 "uncertainty": uncertainty.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "epoch": epoch,
-                "val_acc": val_acc,
+                "val_best_acc": val_metrics["best_acc"],
+                "val_eer": val_metrics["eer"],
+                "val_roc_auc": val_metrics["roc_auc"],
+                "val_tar": val_metrics["tar"],
+                "val_far": val_metrics["far"],
             }
             torch.save(ckpt, Path(args.output) / "best.pt")
     wandb_finish(wandb_run)
